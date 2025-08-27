@@ -11,8 +11,8 @@ from supabase import create_client, Client
 
 # ============== CONFIG ==============
 st.set_page_config(page_title="Tablero de Turnos (Cloud)", layout="wide")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_URL = os.getenv("https://orkuxlmlgstvyuqdsjnz.supabase.co")
+SUPABASE_ANON_KEY = os.getenv("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ya3V4bG1sZ3N0dnl1cWRzam56Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTYyOTY0OTIsImV4cCI6MjA3MTg3MjQ5Mn0.YIBTTno7jQcDBedPDo25cYWr001SG6l9l36VOmeDrsc")
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     st.error("Faltan variables de entorno SUPABASE_URL y/o SUPABASE_ANON_KEY.")
