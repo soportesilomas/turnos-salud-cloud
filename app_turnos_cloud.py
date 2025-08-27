@@ -1,22 +1,36 @@
+# app_turnos_cloud.py
+# Tablero de turnos en la nube con:
+# - Login/registro Supabase (roles: admin / viewer)
+# - Carga de Excel/CSV (solo admin) con upsert deduplicado por row_id
+# - Normalización de fechas a UTC (timestamptz)
+# - Filtros por fecha y campos
+# - KPIs, evolución temporal, resumen por período, heatmap horario y curva horaria
+# - Exportación CSV/Excel
+#
+# Requisitos (requirements.txt):
+#   streamlit>=1.36
+#   pandas>=2.2
+#   openpyxl>=3.1
+#   supabase>=2.5.3
+#   numpy>=1.26
+
 import os
 import io
 import hashlib
 from datetime import datetime
+import numpy as np
 import pandas as pd
 import streamlit as st
-import altair as alt
-
-# --- Supabase client ---
 from supabase import create_client, Client
 
-# ============== CONFIG ==============
+# =========================
+# CONFIGURACIÓN / SECRETS
+# =========================
 st.set_page_config(page_title="Tablero de Turnos (Cloud)", layout="wide")
 
-# Leer variables desde st.secrets (Streamlit Cloud) o desde entorno local
-SUPABASE_URL = (st.secrets.get("SUPABASE_URL")
-                if hasattr(st, "secrets") else None) or os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = (st.secrets.get("SUPABASE_ANON_KEY")
-                     if hasattr(st, "secrets") else None) or os.getenv("SUPABASE_ANON_KEY")
+# Leer primero de st.secrets (Streamlit Cloud), o de variables de entorno en local
+SUPABASE_URL = (st.secrets.get("SUPABASE_URL") if hasattr(st, "secrets") else None) or os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = (st.secrets.get("SUPABASE_ANON_KEY") if hasattr(st, "secrets") else None) or os.getenv("SUPABASE_ANON_KEY")
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     st.error("Faltan variables de entorno SUPABASE_URL y/o SUPABASE_ANON_KEY.")
@@ -24,14 +38,18 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
+# Columnas esperadas en los excels del sistema
 REQUIRED_COLS = [
     "Fecha", "Hora", "Tipo Turno", "Paciente", "DNI", "Teléfonos", "Mail",
     "Cobertura", "Ubicación", "Efector", "Procedimiento",
     "Domicilio", "Localidad", "Edad", "Estado", "Atendido"
 ]
 
-# ============== UTILS ==============
+# =========================
+# UTILIDADES
+# =========================
 def read_any(file):
+    """Lee CSV/Excel intentando separadores comunes en CSV."""
     name = file.name.lower()
     if name.endswith(".csv"):
         for sep in [",", ";", "\t"]:
@@ -47,6 +65,48 @@ def read_any(file):
     else:
         return pd.read_excel(file, engine="openpyxl")
 
+def to_iso_utc(ts):
+    """Convierte pandas/py datetime a ISO-8601 UTC (terminado en Z). Devuelve None si no es válido."""
+    if pd.isna(ts):
+        return None
+    try:
+        ts = pd.to_datetime(ts, errors="coerce")
+        if pd.isna(ts):
+            return None
+        # si no tiene tz, asumimos hora de Argentina y pasamos a UTC
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("America/Argentina/Buenos_Aires", nonexistent="NaT", ambiguous="NaT")
+        ts = ts.tz_convert("UTC")
+        return ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    except Exception:
+        return None
+
+def safe_json_value(v):
+    """Vuelve serializable cualquier valor común de pandas/numpy para JSON."""
+    if v is None:
+        return None
+    if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+        return None
+    if pd.isna(v):
+        return None
+    if isinstance(v, (pd.Timestamp, )):
+        return to_iso_utc(v)
+    if isinstance(v, (np.integer, )):
+        return int(v)
+    if isinstance(v, (np.floating, )):
+        return float(v)
+    return v
+
+def safe_json_records(df: pd.DataFrame):
+    """Convierte un DataFrame a lista de dicts 100% JSON-serializable."""
+    records = []
+    for _, row in df.iterrows():
+        rec = {}
+        for k, v in row.items():
+            rec[k] = safe_json_value(v)
+        records.append(rec)
+    return records
+
 def fetch_profiles(user_id):
     res = supabase.table("profiles").select("role").eq("user_id", user_id).single().execute()
     if res.data:
@@ -54,6 +114,7 @@ def fetch_profiles(user_id):
     return "viewer"
 
 def fetch_turnos(date_from=None, date_to=None, page_size=5000, max_pages=40):
+    """Trae datos paginando. Aplica filtro por fecha_hora en el servidor si se pasa."""
     q = supabase.table("turnos").select("*", count="exact")
     if date_from and date_to:
         q = q.gte("fecha_hora", date_from.isoformat()).lte("fecha_hora", date_to.isoformat())
@@ -72,7 +133,9 @@ def fetch_turnos(date_from=None, date_to=None, page_size=5000, max_pages=40):
         return pd.DataFrame()
     return pd.DataFrame(all_rows)
 
-# ============== AUTH UI ==============
+# =========================
+# AUTENTICACIÓN
+# =========================
 st.sidebar.title("🔐 Acceso")
 if "session" not in st.session_state:
     st.session_state.session = None
@@ -111,14 +174,18 @@ if st.sidebar.button("Cerrar sesión"):
 
 st.title("🏥 Tablero de Turnos (Cloud con Supabase)")
 
-# ============== ADMIN: CARGA DE DATOS ==============
+# =========================
+# ADMIN: CARGA DE EXCEL/CSV
+# =========================
 if role == "admin":
     st.header("📥 Cargar/Unificar Excel/CSV (solo administradores)")
     files = st.file_uploader("Subí uno o varios archivos", type=["xlsx","xls","csv"], accept_multiple_files=True)
+
     if files:
         st.write("Archivos seleccionados:")
         for f in files:
             st.write(f"- {f.name}")
+
         if st.button("➕ Subir y unificar en base"):
             all_new = []
             for f in files:
@@ -128,7 +195,7 @@ if role == "admin":
                     st.error(f"❌ {f.name}: faltan columnas {missing}. No se sube.")
                     continue
 
-                # ---- convertir fecha_hora a UTC ----
+                # ---- construir fecha_hora (Argentina -> UTC) ----
                 fh = pd.to_datetime(
                     df["Fecha"].astype(str).str.strip() + " " + df["Hora"].astype(str).str.strip(),
                     dayfirst=True,
@@ -143,7 +210,7 @@ if role == "admin":
                         pass
                 df["fecha_hora"] = fh
 
-                # ---- row_id hash ----
+                # ---- row_id estable (texto) ----
                 row_parts = (
                     df["DNI"].astype(str).fillna("")
                     + "|" + df["Fecha"].astype(str).fillna("")
@@ -153,7 +220,7 @@ if role == "admin":
                 )
                 df["row_id"] = row_parts.apply(lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
 
-                # ---- renombrar columnas ----
+                # ---- renombrar a snake_case ----
                 rename = {
                     "Fecha": "fecha",
                     "Hora": "hora",
@@ -178,6 +245,8 @@ if role == "admin":
                         "cobertura","ubicacion","efector","procedimiento","domicilio","localidad",
                         "edad","estado","atendido","fecha_hora"]
                 df = df[cols].copy()
+
+                # trazabilidad
                 df["user_id"] = user.id
 
                 all_new.append(df)
@@ -185,15 +254,16 @@ if role == "admin":
             if all_new:
                 data = pd.concat(all_new, ignore_index=True)
 
-                # ---- upsert en lotes ----
+                # Normalizar fecha_hora a ISO-UTC y tipos JSON-serializables
+                if "fecha_hora" in data.columns:
+                    data["fecha_hora"] = data["fecha_hora"].apply(to_iso_utc)
+
+                # Upsert en lotes chicos + payload seguro
                 BATCH = 200
                 total = 0
                 for i in range(0, len(data), BATCH):
                     chunk = data.iloc[i:i+BATCH].copy()
-                    if "fecha_hora" in chunk.columns:
-                        fh_iso = pd.to_datetime(chunk["fecha_hora"], errors="coerce", utc=True).dt.tz_convert("UTC").dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-                        chunk["fecha_hora"] = fh_iso
-                    payload = chunk.to_dict(orient="records")
+                    payload = safe_json_records(chunk)
                     supabase.table("turnos").upsert(payload, on_conflict="row_id").execute()
                     total += len(chunk)
 
@@ -203,7 +273,9 @@ if role == "admin":
 else:
     st.info("Ingresaste con rol de **lectura**. Si necesitás subir datos, pedile al administrador que te cambie a 'admin'.")
 
-# ============== FILTROS Y DASHBOARD ==============
+# =========================
+# FILTROS (RANGO DE FECHAS)
+# =========================
 st.header("🔎 Filtros")
 today = datetime.utcnow()
 default_from = pd.Timestamp(today) - pd.Timedelta(days=90)
@@ -219,63 +291,163 @@ if df.empty:
     st.warning("No hay datos en el rango/condiciones seleccionadas.")
     st.stop()
 
-# Filtros adicionales
-col1, col2, col3 = st.columns(3)
-with col1:
-    ubic_sel = st.multiselect("Ubicación", options=sorted(df["ubicacion"].dropna().unique()))
-    if ubic_sel:
-        df = df[df["ubicacion"].isin(ubic_sel)]
-with col2:
-    tipo_sel = st.multiselect("Tipo de Turno", options=sorted(df["tipo_turno"].dropna().unique()))
-    if tipo_sel:
-        df = df[df["tipo_turno"].isin(tipo_sel)]
-with col3:
-    estado_sel = st.multiselect("Estado", options=sorted(df["estado"].dropna().unique()))
-    if estado_sel:
-        df = df[df["estado"].isin(estado_sel)]
+# =========================
+# FILTROS POR CAMPOS
+# =========================
+def ms(label, series):
+    vals = sorted([str(x) for x in pd.Series(series).dropna().astype(str).unique()])
+    if not vals: return None
+    return st.multiselect(label, vals)
 
-st.write(f"Total de registros filtrados: {len(df):,}")
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    sel_ubic = ms("Ubicación", df.get("ubicacion"))
+with c2:
+    sel_cob = ms("Cobertura", df.get("cobertura"))
+with c3:
+    sel_proc = ms("Procedimiento", df.get("procedimiento"))
+with c4:
+    sel_efec = ms("Efector", df.get("efector"))
 
-# ============== KPIs ==============
-st.subheader("📊 Indicadores Clave (KPIs)")
-col1, col2, col3 = st.columns(3)
-col1.metric("Cantidad de turnos", f"{len(df):,}")
-if "estado" in df.columns:
-    cancelados = df[df["estado"].str.contains("cancel", case=False, na=False)]
-    col2.metric("Cancelados", f"{len(cancelados):,}")
-else:
-    col2.metric("Cancelados", "N/D")
-if "atendido" in df.columns:
-    atendidos = df[df["atendido"].str.lower().eq("si")]
-    col3.metric("Atendidos", f"{len(atendidos):,}")
-else:
-    col3.metric("Atendidos", "N/D")
+c5, c6, c7, c8 = st.columns(4)
+with c5:
+    sel_estado = ms("Estado", df.get("estado"))
+with c6:
+    sel_atendido = ms("Atendido", df.get("atendido"))
+with c7:
+    sel_localidad = ms("Localidad", df.get("localidad"))
+with c8:
+    sel_tipo = ms("Tipo Turno", df.get("tipo_turno"))
 
-# ============== Gráfico de barras por mes ==============
-st.subheader("📈 Evolución mensual de turnos")
-df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce", dayfirst=True)
-df["mes"] = df["fecha"].dt.to_period("M").astype(str)
-mes_counts = df.groupby("mes").size().reset_index(name="cantidad")
-chart = alt.Chart(mes_counts).mark_bar().encode(
-    x=alt.X("mes", sort=None),
-    y="cantidad"
-)
-st.altair_chart(chart, use_container_width=True)
+dff = df.copy()
 
-# ============== Heatmap horario ==============
-st.subheader("🌡️ Mapa de calor por hora del día")
-df["hora_dt"] = pd.to_datetime(df["hora"], format="%H:%M", errors="coerce")
-df["hora_num"] = df["hora_dt"].dt.hour
-heat = df.groupby(["mes", "hora_num"]).size().reset_index(name="cantidad")
-heatmap = alt.Chart(heat).mark_rect().encode(
-    x=alt.X("hora_num:O", title="Hora del día"),
-    y=alt.Y("mes:O", title="Mes"),
-    color=alt.Color("cantidad:Q", scale=alt.Scale(scheme="reds")),
-    tooltip=["mes", "hora_num", "cantidad"]
-)
-st.altair_chart(heatmap, use_container_width=True)
+def apply_in(d, col, vals):
+    if col in d.columns and vals:
+        return d[d[col].astype(str).isin(vals)]
+    return d
 
-# ============== Exportar CSV ==============
-st.subheader("📤 Exportar datos filtrados")
+dff = apply_in(dff, "ubicacion", sel_ubic)
+dff = apply_in(dff, "cobertura", sel_cob)
+dff = apply_in(dff, "procedimiento", sel_proc)
+dff = apply_in(dff, "efector", sel_efec)
+dff = apply_in(dff, "estado", sel_estado)
+dff = apply_in(dff, "atendido", sel_atendido)
+dff = apply_in(dff, "localidad", sel_localidad)
+dff = apply_in(dff, "tipo_turno", sel_tipo)
+
+# =========================
+# KPIs
+# =========================
+st.header("📈 Indicadores")
+k1, k2, k3, k4 = st.columns(4)
+with k1:
+    st.metric("Atenciones (filtrado)", len(dff))
+with k2:
+    st.metric("Pacientes únicos (DNI)", pd.Series(dff.get("dni")).nunique(dropna=True) if "dni" in dff.columns else "—")
+with k3:
+    st.metric("Centros activos", pd.Series(dff.get("ubicacion")).nunique(dropna=True) if "ubicacion" in dff.columns else "—")
+with k4:
+    edad_num = pd.to_numeric(dff.get("edad"), errors="coerce") if "edad" in dff.columns else pd.Series(dtype=float)
+    st.metric("Edad promedio", f"{edad_num.mean():.1f}" if not edad_num.dropna().empty else "—")
+
+# =========================
+# GRÁFICOS
+# =========================
+st.header("📊 Gráficos")
+
+# Evolución temporal
+if "fecha_hora" in dff.columns:
+    try:
+        dff["_fh"] = pd.to_datetime(dff["fecha_hora"], errors="coerce", utc=True)
+        st.write("**Evolución en el tiempo**")
+        freq = st.selectbox("Frecuencia", ["Día", "Semana", "Mes"], index=2)
+        rule = {"Día": "D", "Semana": "W", "Mes": "MS"}[freq]
+        ts = dff.set_index("_fh").sort_index()
+        serie = ts.groupby(pd.Grouper(freq=rule)).size().rename("Atenciones")
+        st.line_chart(serie)
+    except Exception:
+        st.caption("No se pudo graficar la serie temporal (fecha_hora inválida).")
+
+# Barras principales
+if not dff.empty:
+    if "ubicacion" in dff.columns:
+        st.write("**Atenciones por centro (Top 15)**")
+        st.bar_chart(dff["ubicacion"].astype(str).value_counts().head(15))
+    if "procedimiento" in dff.columns:
+        st.write("**Atenciones por procedimiento (Top 15)**")
+        st.bar_chart(dff["procedimiento"].astype(str).value_counts().head(15))
+    if "cobertura" in dff.columns:
+        st.write("**Distribución por cobertura (Top 15)**")
+        st.bar_chart(dff["cobertura"].astype(str).value_counts().head(15))
+    if "efector" in dff.columns:
+        st.write("**Ranking de efectores (Top 15)**")
+        st.bar_chart(dff["efector"].astype(str).value_counts().head(15))
+
+# Resumen por período
+st.header("📅 Resumen por período")
+if "fecha_hora" in dff.columns:
+    try:
+        dff["_fh"] = pd.to_datetime(dff["fecha_hora"], errors="coerce", utc=True)
+        period = st.selectbox("Periodo de resumen", ["Mensual", "Semanal"], index=0)
+        if period == "Mensual":
+            dff["_Periodo"] = dff["_fh"].dt.to_period("M").dt.to_timestamp()
+        else:
+            dff["_Periodo"] = dff["_fh"].dt.to_period("W-MON").dt.start_time
+        if "ubicacion" in dff.columns:
+            pivot = dff.pivot_table(index="_Periodo", columns="ubicacion", values="row_id", aggfunc="count", fill_value=0).sort_index()
+            pivot_total = pd.DataFrame({"Total": pivot.sum(axis=1)}).join(pivot)
+        else:
+            pivot_total = dff.groupby("_Periodo").size().rename("Total").to_frame()
+        st.dataframe(pivot_total, use_container_width=True)
+        st.bar_chart(pivot_total["Total"])
+        st.download_button(
+            "Descargar resumen CSV",
+            data=pivot_total.to_csv(index=True).encode("utf-8-sig"),
+            file_name=f"resumen_{'mensual' if period=='Mensual' else 'semanal'}.csv",
+            mime="text/csv"
+        )
+    except Exception:
+        st.caption("No se pudo calcular el resumen por período.")
+
+# Heatmap + Curva horaria
+st.header("🔥 Heatmap de demanda por hora")
+if "fecha_hora" in dff.columns and not dff.empty:
+    try:
+        dff["_fh"] = pd.to_datetime(dff["fecha_hora"], errors="coerce", utc=True)
+        dff["_hora"] = dff["_fh"].dt.hour
+        dff["_dow"] = dff["_fh"].dt.dayofweek  # 0=Mon
+        dow_names = {0:"Lun",1:"Mar",2:"Mié",3:"Jue",4:"Vie",5:"Sáb",6:"Dom"}
+        dff["_dow_name"] = dff["_dow"].map(dow_names)
+        heat = dff.pivot_table(index="_dow_name", columns="_hora", values="row_id", aggfunc="count", fill_value=0)
+        heat = heat.reindex(["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"])
+        st.dataframe(heat, use_container_width=True)
+        st.write("**Curva horaria promedio (todas las fechas)**")
+        curve = heat.sum(axis=0)  # total por hora
+        st.line_chart(curve)
+    except Exception:
+        st.caption("No se pudo generar el heatmap/curva horaria.")
+
+# =========================
+# TABLA Y EXPORT
+# =========================
+st.header("📋 Datos filtrados")
+default_cols = ["fecha","hora","ubicacion","procedimiento","efector","cobertura","paciente","dni","edad","estado","atendido","localidad"]
+keep_cols = [c for c in default_cols if c in dff.columns]
+show_cols = st.multiselect("Columnas a mostrar", list(dff.columns), default=keep_cols if keep_cols else list(dff.columns)[:12])
+st.dataframe(dff[show_cols] if show_cols else dff, use_container_width=True)
+
+st.subheader("⬇️ Exportar")
+csv_bytes = (dff[show_cols] if show_cols else dff).to_csv(index=False).encode("utf-8-sig")
+st.download_button("Descargar CSV (filtrado)", data=csv_bytes, file_name="turnos_filtrado.csv", mime="text/csv")
+
+def to_excel_bytes(df_to_export: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        (df_to_export[show_cols] if show_cols else df_to_export).to_excel(writer, index=False, sheet_name="Filtrado")
+    return buf.getvalue()
+
+xlsx_bytes = to_excel_bytes(dff)
+st.download_button("Descargar Excel (filtrado)", data=xlsx_bytes, file_name="turnos_filtrado.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 csv = df.to_csv(index=False).encode("utf-8")
 st.download_button("⬇️ Descargar CSV", csv, "turnos_filtrados.csv", "text/csv")
